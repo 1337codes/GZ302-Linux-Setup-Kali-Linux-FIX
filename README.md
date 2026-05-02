@@ -34,8 +34,9 @@ sudo reboot
    - Tolerates the missing `asus-armoury` driver (not in Kali's kernel).
    - Adds `users`-group write perms on `asus-nb-wmi/ppt_*` so TDP/profile changes work without sudo.
 4. Relocates the tray app from any user's Downloads folder to `/opt/gz302-tray` and rewrites every desktop launcher (system + per-user). Re-syncs `/opt` from a fresh source if the upstream installer drops a newer copy.
-5. Adds the user to the `users` group for unprivileged `z13ctl` access.
-6. Sets sensible defaults: 80% battery limit, balanced profile.
+5. Installs a Bluetooth resume hook (`/usr/lib/systemd/system-sleep/gz302-bluetooth.sh`) — resets HCI and restarts `bluetoothd` on resume so BT mice/devices reconnect cleanly after suspend/hibernate (fixes flaky MT7925 BT on Strix Halo).
+6. Adds the user to the `users` group for unprivileged `z13ctl` access.
+7. Sets sensible defaults: 80% battery limit, balanced profile.
 
 ## Requirements
 
