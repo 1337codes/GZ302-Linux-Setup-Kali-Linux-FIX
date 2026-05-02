@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Z13 RGB Control
+GenericName=RGB Lighting
+Comment=Control keyboard and lightbar RGB on the ASUS ROG Flow Z13 (GZ302)
+Exec=python3 /opt/z13-rgb-control/z13rgb.py
+Icon=preferences-desktop-color
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=RGB;keyboard;lightbar;ASUS;Z13;GZ302;Strix;Halo;lighting;
+StartupNotify=true
+StartupWMClass=z13rgb
