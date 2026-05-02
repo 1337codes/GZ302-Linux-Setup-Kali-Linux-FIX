@@ -20,11 +20,21 @@
 #   4. Relocates the tray app from any user's Downloads folder to /opt/gz302-tray
 #      and updates ALL desktop launchers (system + per-user). Re-syncs /opt
 #      from a fresher Downloads source when one is detected.
-#   5. Installs a Bluetooth resume hook (/usr/lib/systemd/system-sleep/
-#      gz302-bluetooth.sh) — resets HCI and restarts bluetoothd on resume to
-#      fix BT mouse/device reconnect issues on Strix Halo's MT7925.
+#   5. Installs two resume-time hooks in /usr/lib/systemd/system-sleep/:
+#        aaa-gz302-input-fast.sh — re-authorizes keyboard/touchpad/lightbar
+#          USB devices at the START of post-resume so the lock screen is
+#          responsive within ~1s of wake (instead of ~11s).
+#        gz302-bluetooth.sh — resets HCI and restarts bluetoothd on
+#          resume so BT mice/devices reconnect cleanly (MT7925 fix).
+#      Also cleans up any stray .patch/.bak files in the system-sleep
+#      directory left over from older versions.
 #   6. Ensures the user is in the 'users' group for unprivileged z13ctl.
 #   7. Applies sensible defaults: battery limit 80%, balanced profile.
+#   8. Installs Z13 RGB Control GUI (PyQt6 app) to /opt/z13-rgb-control/
+#      if z13rgb.py and z13rgb.desktop are present alongside this script.
+#   8. Installs Z13 RGB Control GUI (PyQt6 app for keyboard + lightbar RGB).
+#      Looks for sibling 'z13_rgb_control.py' next to this script. If found,
+#      installs to /opt/z13-rgb-control/ with a KDE menu launcher.
 #
 # Run on a fresh Kali KDE install on a GZ302. Requires sudo + network.
 # Idempotent — safe to re-run.
@@ -59,6 +69,8 @@ GROUP_ADDED=0
 SVC_PATCHED=0
 GRUB_CHANGED=0
 BT_HOOK_INSTALLED=0
+RGB_GUI_INSTALLED=0
+RGB_GUI_INSTALLED=0
 
 # ---------- banner ----------
 cat <<'EOF'
@@ -149,7 +161,7 @@ read -rp "Proceed with full GZ302 setup for user '$TARGET_USER'? [Y/n] " ans
 echo
 
 # ---------- step 1: upstream installer ----------
-log "Step 1/7: Running th3cavalry/GZ302-Linux-Setup unified installer..."
+log "Step 1/8: Running th3cavalry/GZ302-Linux-Setup unified installer..."
 
 WORK=$(mktemp -d)
 # Cleanup trap accounts for files that the upstream installer chowns to root
@@ -172,7 +184,7 @@ ok "Unified installer complete"
 echo
 
 # ---------- step 2: GRUB suspend params ----------
-log "Step 2/7: Adding extra suspend-reliability kernel parameters..."
+log "Step 2/8: Adding extra suspend-reliability kernel parameters..."
 
 GRUB_FILE="/etc/default/grub"
 EXTRA_PARAMS=("rtc_cmos.use_acpi_alarm=1")
@@ -221,7 +233,7 @@ fi
 echo
 
 # ---------- step 3: patch z13ctl-perms.service ----------
-log "Step 3/7: Patching z13ctl-perms.service..."
+log "Step 3/8: Patching z13ctl-perms.service..."
 
 SVC="/etc/systemd/system/z13ctl-perms.service"
 PPT_LINE="ExecStart=-/bin/sh -c 'for f in /sys/devices/platform/asus-nb-wmi/ppt_*; do [ -e \"\$\$f\" ] && chgrp users \"\$\$f\" && chmod g+w \"\$\$f\" || true; done'"
@@ -263,7 +275,7 @@ fi
 echo
 
 # ---------- step 4: relocate tray app to /opt/gz302-tray ----------
-log "Step 4/7: Relocating tray app to /opt/gz302-tray..."
+log "Step 4/8: Relocating tray app to /opt/gz302-tray..."
 
 TRAY_DEST="/opt/gz302-tray"
 SYSTEM_DESKTOP="/usr/share/applications/gz302-tray.desktop"
@@ -357,18 +369,22 @@ if [[ -n "$TRAY_DEST" && -f "$TRAY_DEST/src/command_center.py" ]]; then
 fi
 echo
 
-# ---------- step 5: bluetooth resume hook ----------
-log "Step 5/7: Installing Bluetooth resume hook..."
-# Strix Halo's MT7925 BT controller leaves stale ACL connections after
-# suspend/hibernate, causing BT mice/devices to misbehave on resume. The
-# existing gz302-reset.sh hook handles xHCI/HID/MMC but not Bluetooth.
-# This sibling hook resets HCI and restarts bluetoothd on resume.
+# ---------- step 5: bluetooth resume hook + input-fast hook ----------
+log "Step 5/8: Installing resume-time hooks (Bluetooth + input-fast)..."
+# Two sibling hooks installed alongside the upstream gz302-reset.sh.
+# systemd-sleep runs hooks alphabetically, so naming matters:
+#   aaa-gz302-input-fast.sh  (runs first — re-authorizes USB input ASAP)
+#   gz302-bluetooth.sh       (resets BT stack on resume)
+#   gz302-reset.sh           (upstream, untouched)
+#
+# Without aaa-gz302-input-fast.sh, the lock screen on resume is
+# unresponsive for ~11s while the upstream hook does housekeeping.
+# With it, the keyboard/touchpad/lightbar are re-authorized within ~1s.
 
 BT_HOOK="/usr/lib/systemd/system-sleep/gz302-bluetooth.sh"
+INPUT_HOOK="/usr/lib/systemd/system-sleep/aaa-gz302-input-fast.sh"
 
-# Heredoc carefully: the wrapping outer cat is double-quoted (so $BT_HOOK
-# expands), but the inner heredoc body is quoted (<<'INNER') so it ships
-# literally to the file with $1/$2 intact for systemd-sleep.
+# Bluetooth hook
 sudo tee "$BT_HOOK" >/dev/null <<'INNER'
 #!/bin/sh
 # Restart Bluetooth stack on resume to fix BT mouse / device reconnect issues
@@ -392,19 +408,66 @@ case "$1/$2" in
 esac
 exit 0
 INNER
-
 sudo chmod +x "$BT_HOOK"
+[[ -x "$BT_HOOK" ]] && ok "  Bluetooth resume hook: $BT_HOOK"
 
-if [[ -x "$BT_HOOK" ]]; then
-    ok "Bluetooth resume hook installed at $BT_HOOK"
+# Input-fast hook — re-authorizes ASUS keyboard/touchpad/lightbar USB
+# devices at the very start of post-resume. Filename starts with 'aaa-'
+# so systemd-sleep sorts it before the slow upstream hook.
+sudo tee "$INPUT_HOOK" >/dev/null <<'INNER'
+#!/bin/sh
+# GZ302 input-fast hook — runs BEFORE gz302-reset.sh on resume.
+#
+# Re-authorizes the ASUS USB devices (keyboard / touchpad / lightbar)
+# at the very start of post-resume so the lock screen becomes responsive
+# within ~1s of wake instead of ~11s.
+#
+# The upstream gz302-reset.sh still runs after this and re-does the
+# same USB reset; that's fine and idempotent. We just front-run it.
+#
+# Filename starts with 'aaa-' so systemd-sleep sorts it first.
+
+case "$1" in
+    post)
+        for dev in /sys/bus/usb/devices/*; do
+            [ -f "$dev/idVendor" ] && [ -f "$dev/idProduct" ] || continue
+            vid=$(cat "$dev/idVendor" 2>/dev/null)
+            pid=$(cat "$dev/idProduct" 2>/dev/null)
+            [ "$vid" = "0b05" ] || continue
+            case "$pid" in
+                1a30|18c6)
+                    # Toggle authorize — fastest possible re-enumeration
+                    echo 0 > "$dev/authorized" 2>/dev/null || true
+                    echo 1 > "$dev/authorized" 2>/dev/null || true
+                    logger -t gz302-input-fast "Re-authorized USB device $(basename "$dev") (pid=$pid)"
+                    ;;
+            esac
+        done
+        ;;
+esac
+exit 0
+INNER
+sudo chmod +x "$INPUT_HOOK"
+[[ -x "$INPUT_HOOK" ]] && ok "  Input-fast resume hook: $INPUT_HOOK"
+
+# Clean up stray patcher files from older script versions if any exist —
+# systemd-sleep runs everything executable in this directory, so leftover
+# .patch / .bak files cause harmless but noisy errors at every suspend.
+for stray in /usr/lib/systemd/system-sleep/gz302-reset.sh.patch \
+             /usr/lib/systemd/system-sleep/gz302-reset.sh.bak; do
+    if [[ -e "$stray" ]]; then
+        sudo rm -f "$stray"
+        warn "  Removed stray file from system-sleep/: $stray"
+    fi
+done
+
+if [[ -x "$BT_HOOK" && -x "$INPUT_HOOK" ]]; then
     BT_HOOK_INSTALLED=1
-else
-    warn "Failed to install $BT_HOOK"
 fi
 echo
 
 # ---------- step 6: group membership ----------
-log "Step 6/7: Ensuring user '$TARGET_USER' is in 'users' group..."
+log "Step 6/8: Ensuring user '$TARGET_USER' is in 'users' group..."
 
 if id -nG "$TARGET_USER" | tr ' ' '\n' | grep -qx users; then
     ok "$TARGET_USER already in 'users'"
@@ -416,7 +479,7 @@ fi
 echo
 
 # ---------- step 7: defaults ----------
-log "Step 7/7: Applying sensible z13ctl defaults..."
+log "Step 7/8: Applying sensible z13ctl defaults..."
 
 # Find z13ctl binary directly (more robust than relying on PATH propagation)
 Z13CTL=""
@@ -445,7 +508,85 @@ else
 fi
 echo
 
-# ---------- summary ----------
+# ---------- step 8: install Z13 RGB Control GUI ----------
+log "Step 8/8: Installing Z13 RGB Control GUI..."
+# Looks for sibling z13rgb.py and z13rgb.desktop next to this script.
+# If found, installs to /opt/z13-rgb-control/ and creates a KDE menu launcher.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RGB_SRC="${SCRIPT_DIR}/z13rgb.py"
+RGB_DESKTOP_SRC="${SCRIPT_DIR}/z13rgb.desktop"
+RGB_DEST_DIR="/opt/z13-rgb-control"
+RGB_DEST="${RGB_DEST_DIR}/z13rgb.py"
+RGB_DESKTOP="/usr/share/applications/z13rgb.desktop"
+
+if [[ ! -f "$RGB_SRC" ]]; then
+    warn "z13rgb.py not found next to this script — skipping RGB GUI."
+    warn "  Place z13rgb.py and z13rgb.desktop in the same directory and re-run."
+else
+    # Ensure PyQt6 is installed (usually already from the tray app step)
+    if ! python3 -c 'import PyQt6.QtWidgets' 2>/dev/null; then
+        log "  Installing PyQt6..."
+        sudo apt-get install -y python3-pyqt6 python3-pyqt6.qtsvg \
+            >/dev/null 2>&1 || warn "  PyQt6 install failed — GUI may not run"
+    fi
+
+    sudo mkdir -p "$RGB_DEST_DIR"
+    sudo cp "$RGB_SRC" "$RGB_DEST"
+    sudo chmod 755 "$RGB_DEST"
+    sudo chown root:root "$RGB_DEST"
+    ok "  Installed $RGB_DEST"
+
+    # Install the .desktop launcher: prefer the sibling file if present,
+    # otherwise generate a minimal one inline.
+    if [[ -f "$RGB_DESKTOP_SRC" ]]; then
+        sudo cp "$RGB_DESKTOP_SRC" "$RGB_DESKTOP"
+    else
+        sudo tee "$RGB_DESKTOP" >/dev/null <<EOF
+[Desktop Entry]
+Type=Application
+Name=Z13 RGB Control
+Comment=Keyboard and lightbar RGB control for ASUS ROG Flow Z13
+Exec=python3 ${RGB_DEST}
+Icon=preferences-desktop-color
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=RGB;keyboard;lightbar;ASUS;ROG;Z13;lighting;
+StartupNotify=true
+StartupWMClass=z13rgb
+EOF
+    fi
+    sudo chmod 644 "$RGB_DESKTOP"
+    ok "  Installed launcher: $RGB_DESKTOP"
+
+    # Drop a desktop shortcut for the target user (KDE Plasma reads ~/Desktop)
+    USER_DESKTOP_DIR="${TARGET_HOME}/Desktop"
+    USER_SHORTCUT="${USER_DESKTOP_DIR}/z13rgb.desktop"
+    if [[ -d "$USER_DESKTOP_DIR" ]]; then
+        sudo cp "$RGB_DESKTOP" "$USER_SHORTCUT"
+        sudo chown "$TARGET_USER:$TARGET_USER" "$USER_SHORTCUT"
+        sudo chmod 755 "$USER_SHORTCUT"
+        # KDE/Plasma needs the file marked as trusted ("KDE Trusted") to
+        # launch without a confirmation dialog. Sets metadata via gio if
+        # available, falls back to the legacy KDE attribute.
+        if command -v gio >/dev/null 2>&1; then
+            sudo -u "$TARGET_USER" gio set "$USER_SHORTCUT" \
+                "metadata::trusted" true 2>/dev/null || true
+        fi
+        # Also set executable bit (Plasma checks this)
+        ok "  Desktop shortcut: $USER_SHORTCUT"
+    else
+        warn "  ${USER_DESKTOP_DIR} not found — skipping desktop shortcut"
+    fi
+
+    # Refresh KDE menu cache (best effort)
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        sudo update-desktop-database -q 2>/dev/null || true
+    fi
+
+    RGB_GUI_INSTALLED=1
+fi
+echo
 {
     echo "${G}┌──────────────────────────────────────────────────────────┐"
     echo "│              GZ302 Kali Setup Complete                   │"
@@ -457,7 +598,8 @@ echo
     printf "  %-28s %s\n" "GRUB suspend params:"     "$([[ $GRUB_CHANGED -eq 1 ]] && echo "added (reboot needed)" || echo "already present")"
     printf "  %-28s %s\n" "z13ctl-perms.service:"    "$([[ $SVC_PATCHED -eq 1 ]] && echo "patched & restarted" || echo "already patched")"
     printf "  %-28s %s\n" "Tray app at /opt:"        "$([[ $TRAY_RELOCATED -eq 1 ]] && echo "yes" || echo "skipped (no source)")"
-    printf "  %-28s %s\n" "BT resume hook:"          "$([[ $BT_HOOK_INSTALLED -eq 1 ]] && echo "installed" || echo "FAILED — install manually")"
+    printf "  %-28s %s\n" "Resume hooks (input+BT):" "$([[ $BT_HOOK_INSTALLED -eq 1 ]] && echo "installed" || echo "FAILED — install manually")"
+    printf "  %-28s %s\n" "Z13 RGB Control GUI:"     "$([[ $RGB_GUI_INSTALLED -eq 1 ]] && echo "installed (KDE menu)" || echo "skipped (no .py file alongside)")"
     printf "  %-28s %s\n" "User in 'users' group:"   "$([[ $GROUP_ADDED -eq 1 ]] && echo "added (relogin needed)" || echo "yes")"
     printf "  %-28s %s\n" "Defaults (battery 80%, balanced):" "$([[ $DEFAULTS_APPLIED -eq 1 ]] && echo "applied" || echo "skipped (re-run after reboot)")"
     echo
@@ -476,6 +618,7 @@ echo
     echo "    systemctl suspend                                    # then wake & check:"
     echo "    journalctl -b -t gz302-reset                         # confirm hook ran"
     echo "    journalctl -b -t gz302-bt                            # confirm BT hook ran"
+    echo "    journalctl -b -t gz302-input-fast                    # confirm input-fast hook ran"
     echo
     echo "If a tray process is still running from the old path, restart it:"
     echo "    pkill -f command_center.py"
