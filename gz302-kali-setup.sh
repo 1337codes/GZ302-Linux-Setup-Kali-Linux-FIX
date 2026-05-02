@@ -21,9 +21,13 @@
 #      and updates ALL desktop launchers (system + per-user). Re-syncs /opt
 #      from a fresher Downloads source when one is detected.
 #   5. Installs two resume-time hooks in /usr/lib/systemd/system-sleep/:
-#        aaa-gz302-input-fast.sh — re-authorizes keyboard/touchpad/lightbar
-#          USB devices at the START of post-resume so the lock screen is
-#          responsive within ~1s of wake (instead of ~11s).
+#        aaa-gz302-input-fast.sh — does TWO things on resume:
+#          (a) re-authorizes keyboard/touchpad/lightbar USB devices at
+#              the START of post-resume so the lock screen is responsive
+#              within ~1s of wake (instead of ~11s).
+#          (b) restarts the z13ctl per-user daemon so it picks up fresh
+#              /dev/hidrawN paths after USB re-enumeration. Without this,
+#              the daemon caches stale paths and RGB fails to restore.
 #        gz302-bluetooth.sh — resets HCI and restarts bluetoothd on
 #          resume so BT mice/devices reconnect cleanly (MT7925 fix).
 #      Also cleans up any stray .patch/.bak files in the system-sleep
@@ -412,23 +416,26 @@ sudo chmod +x "$BT_HOOK"
 [[ -x "$BT_HOOK" ]] && ok "  Bluetooth resume hook: $BT_HOOK"
 
 # Input-fast hook — re-authorizes ASUS keyboard/touchpad/lightbar USB
-# devices at the very start of post-resume. Filename starts with 'aaa-'
-# so systemd-sleep sorts it before the slow upstream hook.
+# devices at the very start of post-resume, AND restarts the z13ctl
+# per-user daemon to refresh stale /dev/hidrawN paths. Filename starts
+# with 'aaa-' so systemd-sleep sorts it before the slow upstream hook.
 sudo tee "$INPUT_HOOK" >/dev/null <<'INNER'
 #!/bin/sh
 # GZ302 input-fast hook — runs BEFORE gz302-reset.sh on resume.
 #
-# Re-authorizes the ASUS USB devices (keyboard / touchpad / lightbar)
-# at the very start of post-resume so the lock screen becomes responsive
-# within ~1s of wake instead of ~11s.
+# 1. Re-authorizes ASUS USB devices (keyboard / touchpad / lightbar)
+#    so the lock screen accepts input within ~1s of wake (instead of
+#    ~11s with only the upstream hook).
 #
-# The upstream gz302-reset.sh still runs after this and re-does the
-# same USB reset; that's fine and idempotent. We just front-run it.
-#
-# Filename starts with 'aaa-' so systemd-sleep sorts it first.
+# 2. Restarts the z13ctl per-user daemon. The daemon caches
+#    /dev/hidrawN paths at startup, but after suspend the kernel
+#    re-enumerates USB and the hidraw minor numbers shift (hidraw2 ->
+#    hidraw3 etc). Without a restart, the daemon keeps trying to write
+#    to the old path and RGB doesn't restore on wake.
 
 case "$1" in
     post)
+        # 1. Re-authorize ASUS USB devices for fast input
         for dev in /sys/bus/usb/devices/*; do
             [ -f "$dev/idVendor" ] && [ -f "$dev/idProduct" ] || continue
             vid=$(cat "$dev/idVendor" 2>/dev/null)
@@ -436,12 +443,25 @@ case "$1" in
             [ "$vid" = "0b05" ] || continue
             case "$pid" in
                 1a30|18c6)
-                    # Toggle authorize — fastest possible re-enumeration
                     echo 0 > "$dev/authorized" 2>/dev/null || true
                     echo 1 > "$dev/authorized" 2>/dev/null || true
                     logger -t gz302-input-fast "Re-authorized USB device $(basename "$dev") (pid=$pid)"
                     ;;
             esac
+        done
+
+        # 2. Restart z13ctl per-user daemon to refresh stale hidraw paths.
+        # Wait for hidraw nodes to (re)appear after USB re-enumeration.
+        sleep 2
+        for u in $(loginctl list-users --no-legend 2>/dev/null | awk '$1+0 >= 1000 {print $2}'); do
+            uid=$(id -u "$u" 2>/dev/null) || continue
+            [ -d "/run/user/$uid" ] || continue
+            logger -t gz302-input-fast "Attempting z13ctl restart for $u (uid=$uid)"
+            runuser -u "$u" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                systemctl --user restart z13ctl.service 2>&1 \
+                | logger -t gz302-input-fast || true
+            logger -t gz302-input-fast "z13ctl restart attempt completed for $u"
         done
         ;;
 esac
