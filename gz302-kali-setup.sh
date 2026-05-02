@@ -10,15 +10,21 @@
 #   1. Runs th3cavalry/GZ302-Linux-Setup unified installer non-interactively
 #      (hardware fixes + z13ctl + display tools, skips optional modules).
 #   2. Adds extra suspend-reliability kernel params to GRUB:
-#        amd_pmc.enable_stb=1
 #        rtc_cmos.use_acpi_alarm=1
+#      NOTE: amd_pmc.enable_stb=1 is intentionally NOT added — it causes the
+#      amd_pmc driver to fail probe with -ENOMEM on Strix Halo (Smart Trace
+#      Buffer alloc fails). The suspend hook works fine without it.
 #   3. Patches z13ctl-perms.service:
 #        - Tolerates missing asus-armoury driver (not in Kali's kernel)
 #        - Adds asus-nb-wmi/ppt_* group write perms (TDP control)
 #   4. Relocates the tray app from any user's Downloads folder to /opt/gz302-tray
-#      and updates ALL desktop launchers (system + per-user).
-#   5. Ensures the user is in the 'users' group for unprivileged z13ctl.
-#   6. Applies sensible defaults: battery limit 80%, balanced profile.
+#      and updates ALL desktop launchers (system + per-user). Re-syncs /opt
+#      from a fresher Downloads source when one is detected.
+#   5. Installs a Bluetooth resume hook (/usr/lib/systemd/system-sleep/
+#      gz302-bluetooth.sh) — resets HCI and restarts bluetoothd on resume to
+#      fix BT mouse/device reconnect issues on Strix Halo's MT7925.
+#   6. Ensures the user is in the 'users' group for unprivileged z13ctl.
+#   7. Applies sensible defaults: battery limit 80%, balanced profile.
 #
 # Run on a fresh Kali KDE install on a GZ302. Requires sudo + network.
 # Idempotent — safe to re-run.
@@ -46,6 +52,14 @@ warn() { echo "${Y}[!]${N} $*"; }
 err()  { echo "${R}[-]${N} $*" >&2; }
 die()  { err "$*"; exit 1; }
 
+# ---------- result tracking (for accurate final summary) ----------
+DEFAULTS_APPLIED=0
+TRAY_RELOCATED=0
+GROUP_ADDED=0
+SVC_PATCHED=0
+GRUB_CHANGED=0
+BT_HOOK_INSTALLED=0
+
 # ---------- banner ----------
 cat <<'EOF'
    ██████╗ ███████╗██████╗  ██████╗ ██████╗
@@ -64,13 +78,12 @@ if [[ $EUID -eq 0 ]]; then
 fi
 sudo -v || die "sudo authentication failed."
 
+# Keep sudo creds fresh in the background while the script runs
+( while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done ) 2>/dev/null &
+SUDO_KEEPALIVE_PID=$!
+trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
+
 # ---------- detect target user dynamically ----------
-# Priority:
-#   1. Explicit argument: ./gz302-kali-setup.sh someuser
-#   2. $SUDO_USER if running under sudo
-#   3. $USER if it isn't root
-#   4. logname (controlling-terminal owner)
-#   5. First non-system user in /etc/passwd (UID >= 1000, < 65534)
 TARGET_USER="${1:-}"
 if [[ -z "$TARGET_USER" ]]; then
     if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
@@ -136,56 +149,79 @@ read -rp "Proceed with full GZ302 setup for user '$TARGET_USER'? [Y/n] " ans
 echo
 
 # ---------- step 1: upstream installer ----------
-log "Step 1/6: Running th3cavalry/GZ302-Linux-Setup unified installer..."
+log "Step 1/7: Running th3cavalry/GZ302-Linux-Setup unified installer..."
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Cleanup trap accounts for files that the upstream installer chowns to root
+cleanup() {
+    kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    sudo rm -rf "$WORK" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 curl -fL -o "$WORK/gz302-setup.sh" \
     https://raw.githubusercontent.com/th3cavalry/GZ302-Linux-Setup/main/gz302-setup.sh
 chmod +x "$WORK/gz302-setup.sh"
 
-# Run as the target user via sudo so SUDO_USER/HOME resolve correctly inside the upstream script.
-# -y: accept defaults (Y to fixes, z13ctl, display tools)
+# Just sudo — SUDO_USER is preserved automatically and points at TARGET_USER.
+# -y: accept defaults
 # --no-modules: skip Gaming/LLM/Hypervisor packs (Ubuntu-centric, often broken on Kali)
-sudo -u "$TARGET_USER" sudo "$WORK/gz302-setup.sh" -y --no-modules
+sudo "$WORK/gz302-setup.sh" -y --no-modules
 
 ok "Unified installer complete"
 echo
 
 # ---------- step 2: GRUB suspend params ----------
-log "Step 2/6: Adding extra suspend-reliability kernel parameters..."
+log "Step 2/7: Adding extra suspend-reliability kernel parameters..."
 
 GRUB_FILE="/etc/default/grub"
-GRUB_CHANGED=0
-EXTRA_PARAMS=("amd_pmc.enable_stb=1" "rtc_cmos.use_acpi_alarm=1")
+EXTRA_PARAMS=("rtc_cmos.use_acpi_alarm=1")
+# Params we actively REMOVE if found (known-bad on Strix Halo)
+BAD_PARAMS=("amd_pmc.enable_stb=1")
 
-for p in "${EXTRA_PARAMS[@]}"; do
-    if grep -q "$p" "$GRUB_FILE"; then
-        ok "  $p already present"
-    else
-        sudo sed -i -E "s|^(GRUB_CMDLINE_LINUX_DEFAULT=\")(.*)(\")|\1\2 ${p}\3|" "$GRUB_FILE"
-        ok "  $p added"
-        GRUB_CHANGED=1
-    fi
-done
-
-if (( GRUB_CHANGED )); then
-    log "Regenerating GRUB config..."
-    sudo update-grub
-    ok "GRUB updated"
+if ! grep -qE '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_FILE"; then
+    warn "  GRUB_CMDLINE_LINUX_DEFAULT line not found in $GRUB_FILE"
+    warn "  Please add the following params manually then run 'sudo update-grub':"
+    for p in "${EXTRA_PARAMS[@]}"; do echo "      $p"; done
 else
-    ok "GRUB already up to date"
+    # Remove any known-bad params that might be present from older runs
+    for bp in "${BAD_PARAMS[@]}"; do
+        if grep -q "$bp" "$GRUB_FILE"; then
+            # Escape regex metacharacters in the param for sed
+            esc=$(printf '%s' "$bp" | sed 's/[][\.\*\^\$\/]/\\&/g')
+            sudo sed -i "s/ ${esc}//g; s/${esc} //g; s/${esc}//g" "$GRUB_FILE"
+            warn "  Removed known-bad param: $bp"
+            GRUB_CHANGED=1
+        fi
+    done
+
+    for p in "${EXTRA_PARAMS[@]}"; do
+        if grep -q "$p" "$GRUB_FILE"; then
+            ok "  $p already present"
+        else
+            sudo sed -i -E "s|^(GRUB_CMDLINE_LINUX_DEFAULT=\")(.*)(\")|\1\2 ${p}\3|" "$GRUB_FILE"
+            # Verify the param was actually inserted
+            if grep -q "$p" "$GRUB_FILE"; then
+                ok "  $p added"
+                GRUB_CHANGED=1
+            else
+                warn "  Failed to insert $p (regex didn't match) — add manually"
+            fi
+        fi
+    done
+
+    if (( GRUB_CHANGED )); then
+        log "Regenerating GRUB config..."
+        sudo update-grub
+        ok "GRUB updated"
+    else
+        ok "GRUB already up to date"
+    fi
 fi
 echo
 
 # ---------- step 3: patch z13ctl-perms.service ----------
-log "Step 3/6: Patching z13ctl-perms.service..."
-# Two patches:
-#   (a) Prefix ExecStart with '-' so systemd tolerates missing asus-armoury paths
-#       (asus-armoury isn't built into Kali's kernel as of writing).
-#   (b) Add asus-nb-wmi ppt_* permissions so non-root z13ctl can write TDP.
-#       Without this, profile/TDP changes silently fail in the GUI tray.
+log "Step 3/7: Patching z13ctl-perms.service..."
 
 SVC="/etc/systemd/system/z13ctl-perms.service"
 PPT_LINE="ExecStart=-/bin/sh -c 'for f in /sys/devices/platform/asus-nb-wmi/ppt_*; do [ -e \"\$\$f\" ] && chgrp users \"\$\$f\" && chmod g+w \"\$\$f\" || true; done'"
@@ -193,11 +229,11 @@ PPT_LINE="ExecStart=-/bin/sh -c 'for f in /sys/devices/platform/asus-nb-wmi/ppt_
 if [[ ! -f "$SVC" ]]; then
     warn "$SVC not found — skipping (z13ctl install may have failed)"
 else
-    SVC_CHANGED=0
+    SVC_LOCAL_CHANGED=0
     if grep -qE "^ExecStart=/bin/sh" "$SVC"; then
         sudo sed -i 's|^ExecStart=/bin/sh|ExecStart=-/bin/sh|g' "$SVC"
         ok "Added '-' prefix to ExecStart lines"
-        SVC_CHANGED=1
+        SVC_LOCAL_CHANGED=1
     else
         ok "ExecStart lines already prefixed with '-'"
     fi
@@ -205,12 +241,18 @@ else
         ok "asus-nb-wmi ppt_* perms ExecStart already present"
     else
         sudo sed -i "/^\[Install\]/i ${PPT_LINE}\n" "$SVC"
-        ok "Added asus-nb-wmi ppt_* perms ExecStart line"
-        SVC_CHANGED=1
+        # Verify the line was inserted
+        if grep -q "asus-nb-wmi/ppt_" "$SVC"; then
+            ok "Added asus-nb-wmi ppt_* perms ExecStart line"
+            SVC_LOCAL_CHANGED=1
+        else
+            warn "Failed to insert ppt_* ExecStart line — add manually with 'systemctl edit --full z13ctl-perms.service'"
+        fi
     fi
-    if (( SVC_CHANGED )); then
+    if (( SVC_LOCAL_CHANGED )); then
         sudo systemctl daemon-reload
         sudo systemctl restart z13ctl-perms.service || true
+        SVC_PATCHED=1
     fi
     if systemctl is-active --quiet z13ctl-perms.service; then
         ok "z13ctl-perms.service: active"
@@ -221,15 +263,12 @@ fi
 echo
 
 # ---------- step 4: relocate tray app to /opt/gz302-tray ----------
-log "Step 4/6: Relocating tray app to /opt/gz302-tray..."
-# The upstream installer drops the tray source in the user's Downloads folder and
-# points the .desktop launcher at it. That breaks if the user cleans Downloads or
-# the path differs per user. Move it system-wide to /opt and rewrite all launchers.
+log "Step 4/7: Relocating tray app to /opt/gz302-tray..."
 
 TRAY_DEST="/opt/gz302-tray"
 SYSTEM_DESKTOP="/usr/share/applications/gz302-tray.desktop"
 
-# Find the current tray source path from any existing launcher (system or per-user)
+# Find tray source path from any existing launcher (system or per-user)
 find_current_tray_path() {
     local desktop_files=()
     [[ -f "$SYSTEM_DESKTOP" ]] && desktop_files+=("$SYSTEM_DESKTOP")
@@ -246,7 +285,6 @@ find_current_tray_path() {
         path=$(grep -oE 'python3? [^ ]+command_center\.py' "$df" 2>/dev/null \
             | head -1 | awk '{print $2}')
         if [[ -n "$path" && -f "$path" ]]; then
-            # Strip /src/command_center.py to get the project root
             echo "${path%/src/command_center.py}"
             return 0
         fi
@@ -254,30 +292,34 @@ find_current_tray_path() {
     return 1
 }
 
-# 1. If /opt/gz302-tray doesn't exist yet, find current source and copy it
-if [[ ! -d "$TRAY_DEST" ]]; then
-    CURRENT_SRC=$(find_current_tray_path || true)
-    if [[ -n "$CURRENT_SRC" && -d "$CURRENT_SRC" ]]; then
-        log "  Found tray source at: $CURRENT_SRC"
-        sudo cp -r "$CURRENT_SRC" "$TRAY_DEST"
-        sudo chown -R root:root "$TRAY_DEST"
-        sudo find "$TRAY_DEST" -type d -exec chmod 755 {} \;
-        sudo find "$TRAY_DEST" -type f -exec chmod 644 {} \;
-        sudo find "$TRAY_DEST" -type f -name '*.py' -exec chmod 755 {} \;
-        ok "  Copied tray app to $TRAY_DEST"
-    else
-        warn "  No tray source found — tray app may not have installed correctly. Skipping relocation."
-        TRAY_DEST=""
+# Always sync /opt with the latest Downloads source if one exists
+CURRENT_SRC=$(find_current_tray_path || true)
+
+if [[ -n "$CURRENT_SRC" && -d "$CURRENT_SRC" && "$CURRENT_SRC" != "$TRAY_DEST" ]]; then
+    log "  Found tray source at: $CURRENT_SRC"
+    if [[ -d "$TRAY_DEST" ]]; then
+        log "  Refreshing existing $TRAY_DEST..."
+        sudo rm -rf "$TRAY_DEST"
     fi
+    sudo cp -r "$CURRENT_SRC" "$TRAY_DEST"
+    sudo chown -R root:root "$TRAY_DEST"
+    sudo find "$TRAY_DEST" -type d -exec chmod 755 {} \;
+    sudo find "$TRAY_DEST" -type f -exec chmod 644 {} \;
+    sudo find "$TRAY_DEST" -type f -name '*.py' -exec chmod 755 {} \;
+    ok "  Synced tray app to $TRAY_DEST"
+    TRAY_RELOCATED=1
+elif [[ -d "$TRAY_DEST" && -f "$TRAY_DEST/src/command_center.py" ]]; then
+    ok "  $TRAY_DEST already current"
+    TRAY_RELOCATED=1
 else
-    ok "  $TRAY_DEST already exists"
+    warn "  No tray source found — tray app may not have installed correctly. Skipping."
+    TRAY_DEST=""
 fi
 
-# 2. Rewrite all gz302-tray.desktop files to point at /opt/gz302-tray, regardless of user
+# Rewrite all gz302-tray.desktop files to point at /opt
 if [[ -n "$TRAY_DEST" && -f "$TRAY_DEST/src/command_center.py" ]]; then
     NEW_EXEC="python3 ${TRAY_DEST}/src/command_center.py"
 
-    # Collect every gz302-tray.desktop file on the system
     DESKTOP_FILES=()
     [[ -f "$SYSTEM_DESKTOP" ]] && DESKTOP_FILES+=("$SYSTEM_DESKTOP")
     while IFS= read -r -d '' f; do
@@ -295,14 +337,19 @@ if [[ -n "$TRAY_DEST" && -f "$TRAY_DEST/src/command_center.py" ]]; then
                 ok "  Already points to /opt: $df"
             else
                 sudo sed -i "s|^Exec=.*command_center\.py.*|${new_exec_line}|" "$df"
-                ok "  Rewrote: $df"
+                # Verify
+                if grep -q "^${new_exec_line}\$" "$df"; then
+                    ok "  Rewrote: $df"
+                else
+                    warn "  Failed to rewrite $df"
+                fi
             fi
         fi
     done
 
-    # 3. Clean up any stray copies in Downloads folders across all users
+    # Clean up stray copies — but only directories that really contain the tray app
     while IFS= read -r -d '' stray; do
-        if [[ "$stray" != "$TRAY_DEST" ]]; then
+        if [[ "$stray" != "$TRAY_DEST" && -f "$stray/src/command_center.py" ]]; then
             warn "  Removing stray tray source: $stray"
             sudo rm -rf "$stray"
         fi
@@ -310,12 +357,57 @@ if [[ -n "$TRAY_DEST" && -f "$TRAY_DEST/src/command_center.py" ]]; then
 fi
 echo
 
-# ---------- step 5: group membership ----------
-log "Step 5/6: Ensuring user '$TARGET_USER' is in 'users' group..."
+# ---------- step 5: bluetooth resume hook ----------
+log "Step 5/7: Installing Bluetooth resume hook..."
+# Strix Halo's MT7925 BT controller leaves stale ACL connections after
+# suspend/hibernate, causing BT mice/devices to misbehave on resume. The
+# existing gz302-reset.sh hook handles xHCI/HID/MMC but not Bluetooth.
+# This sibling hook resets HCI and restarts bluetoothd on resume.
+
+BT_HOOK="/usr/lib/systemd/system-sleep/gz302-bluetooth.sh"
+
+# Heredoc carefully: the wrapping outer cat is double-quoted (so $BT_HOOK
+# expands), but the inner heredoc body is quoted (<<'INNER') so it ships
+# literally to the file with $1/$2 intact for systemd-sleep.
+sudo tee "$BT_HOOK" >/dev/null <<'INNER'
+#!/bin/sh
+# Restart Bluetooth stack on resume to fix BT mouse / device reconnect issues
+# on Strix Halo (MT7925) after suspend or hibernation.
+case "$1/$2" in
+    post/suspend|post/hibernate|post/hybrid-sleep|post/suspend-then-hibernate)
+        # Wait for kernel to bring HCI back up
+        sleep 2
+        # Reset HCI controller (clears stale ACL connections)
+        if command -v hciconfig >/dev/null 2>&1; then
+            hciconfig hci0 reset 2>/dev/null || true
+        elif command -v btmgmt >/dev/null 2>&1; then
+            btmgmt power off 2>/dev/null || true
+            sleep 1
+            btmgmt power on 2>/dev/null || true
+        fi
+        # Restart daemon — auto-reconnects trusted devices
+        systemctl restart bluetooth.service 2>/dev/null || true
+        logger -t gz302-bt "Bluetooth stack reset after $2"
+        ;;
+esac
+exit 0
+INNER
+
+sudo chmod +x "$BT_HOOK"
+
+if [[ -x "$BT_HOOK" ]]; then
+    ok "Bluetooth resume hook installed at $BT_HOOK"
+    BT_HOOK_INSTALLED=1
+else
+    warn "Failed to install $BT_HOOK"
+fi
+echo
+
+# ---------- step 6: group membership ----------
+log "Step 6/7: Ensuring user '$TARGET_USER' is in 'users' group..."
 
 if id -nG "$TARGET_USER" | tr ' ' '\n' | grep -qx users; then
     ok "$TARGET_USER already in 'users'"
-    GROUP_ADDED=0
 else
     sudo usermod -aG users "$TARGET_USER"
     warn "$TARGET_USER added to 'users' — log out and back in (or reboot) for it to take effect"
@@ -323,51 +415,71 @@ else
 fi
 echo
 
-# ---------- step 6: defaults ----------
-log "Step 6/6: Applying sensible z13ctl defaults..."
+# ---------- step 7: defaults ----------
+log "Step 7/7: Applying sensible z13ctl defaults..."
+
+# Find z13ctl binary directly (more robust than relying on PATH propagation)
+Z13CTL=""
+for cand in /usr/local/bin/z13ctl /usr/bin/z13ctl /usr/sbin/z13ctl; do
+    [[ -x "$cand" ]] && Z13CTL="$cand" && break
+done
+if [[ -z "$Z13CTL" ]]; then
+    Z13CTL=$(sudo -u "$TARGET_USER" -i bash -c 'command -v z13ctl' 2>/dev/null || true)
+fi
 
 if (( GROUP_ADDED )); then
-    warn "Group membership not yet active in this session — skipping. Run after reboot:"
+    warn "Group membership not yet active in this session — skipping defaults."
+    warn "After reboot, run as $TARGET_USER:"
     echo "    z13ctl batterylimit --set 80"
     echo "    z13ctl profile --set balanced"
-elif sudo -u "$TARGET_USER" command -v z13ctl >/dev/null 2>&1; then
-    sudo -u "$TARGET_USER" z13ctl batterylimit --set 80 || warn "batterylimit failed (try after reboot)"
-    sudo -u "$TARGET_USER" z13ctl profile --set balanced || warn "profile set failed (try after reboot)"
-    ok "Battery limit: 80%, Profile: balanced"
+elif [[ -n "$Z13CTL" && -x "$Z13CTL" ]]; then
+    if sudo -u "$TARGET_USER" "$Z13CTL" batterylimit --set 80 \
+       && sudo -u "$TARGET_USER" "$Z13CTL" profile --set balanced; then
+        ok "Battery limit: 80%, Profile: balanced"
+        DEFAULTS_APPLIED=1
+    else
+        warn "Some defaults failed to apply — try after reboot"
+    fi
 else
-    warn "z13ctl not on PATH — re-run defaults manually after reboot"
+    warn "z13ctl binary not found — skipping defaults. Re-run after reboot."
 fi
 echo
 
 # ---------- summary ----------
-cat <<EOF
-${G}┌──────────────────────────────────────────────────────────┐
-│              GZ302 Kali Setup Complete                   │
-└──────────────────────────────────────────────────────────┘${N}
+{
+    echo "${G}┌──────────────────────────────────────────────────────────┐"
+    echo "│              GZ302 Kali Setup Complete                   │"
+    echo "└──────────────────────────────────────────────────────────┘${N}"
+    echo
+    printf "  %-28s %s\n" "User:"                    "$TARGET_USER"
+    printf "  %-28s %s\n" "Hardware fixes:"          "applied (GPU/audio/input/OLED/suspend)"
+    printf "  %-28s %s\n" "z13ctl + display tools:"  "installed"
+    printf "  %-28s %s\n" "GRUB suspend params:"     "$([[ $GRUB_CHANGED -eq 1 ]] && echo "added (reboot needed)" || echo "already present")"
+    printf "  %-28s %s\n" "z13ctl-perms.service:"    "$([[ $SVC_PATCHED -eq 1 ]] && echo "patched & restarted" || echo "already patched")"
+    printf "  %-28s %s\n" "Tray app at /opt:"        "$([[ $TRAY_RELOCATED -eq 1 ]] && echo "yes" || echo "skipped (no source)")"
+    printf "  %-28s %s\n" "BT resume hook:"          "$([[ $BT_HOOK_INSTALLED -eq 1 ]] && echo "installed" || echo "FAILED — install manually")"
+    printf "  %-28s %s\n" "User in 'users' group:"   "$([[ $GROUP_ADDED -eq 1 ]] && echo "added (relogin needed)" || echo "yes")"
+    printf "  %-28s %s\n" "Defaults (battery 80%, balanced):" "$([[ $DEFAULTS_APPLIED -eq 1 ]] && echo "applied" || echo "skipped (re-run after reboot)")"
+    echo
 
-  ✓ User:                  $TARGET_USER
-  ✓ Hardware fixes         (GPU, audio, input, OLED PSR-SU, suspend hook)
-  ✓ z13ctl                 (RGB, TDP, fan curves, battery limit)
-  ✓ Display tools          + KDE Plasma tray app
-  ✓ GRUB params            (extra suspend-reliability)
-  ✓ z13ctl-perms.service   patched (asus-armoury tolerant + ppt_* perms)
-  ✓ Tray app relocated     to /opt/gz302-tray (stable system path)
-  ✓ Group membership       'users' for unprivileged z13ctl
-  ✓ Defaults               battery 80%, profile balanced
+    if (( GRUB_CHANGED )) || (( GROUP_ADDED )); then
+        echo "${Y}REBOOT REQUIRED${N} for kernel params and/or group membership:"
+        echo "    sudo reboot"
+        echo
+    fi
 
-${Y}REBOOT REQUIRED${N} for kernel params and group membership to take effect:
-
-    sudo reboot
-
-After reboot, smoke test:
-
-    cat /proc/cmdline                       # verify kernel params
-    systemctl status z13ctl-perms.service   # active (exited)
-    z13ctl status                           # current state
-    grep ^Exec /usr/share/applications/gz302-tray.desktop  # /opt path
-    systemctl suspend                       # then wake & check:
-    journalctl -b -t gz302-reset            # confirm suspend hook ran
-
-The "GZ302 Dashboard" tray icon should appear in your KDE Plasma panel
-on next login.
-EOF
+    echo "Smoke test after reboot:"
+    echo "    cat /proc/cmdline                                    # kernel params"
+    echo "    systemctl status z13ctl-perms.service                # active (exited)"
+    echo "    z13ctl status                                        # current state"
+    echo "    grep ^Exec /usr/share/applications/gz302-tray.desktop # /opt path"
+    echo "    systemctl suspend                                    # then wake & check:"
+    echo "    journalctl -b -t gz302-reset                         # confirm hook ran"
+    echo "    journalctl -b -t gz302-bt                            # confirm BT hook ran"
+    echo
+    echo "If a tray process is still running from the old path, restart it:"
+    echo "    pkill -f command_center.py"
+    echo "    nohup python3 /opt/gz302-tray/src/command_center.py >/dev/null 2>&1 &"
+    echo "    disown"
+    echo "(Or just log out + back in — autostart handles it.)"
+}
