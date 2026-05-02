@@ -19,12 +19,16 @@ Fully dynamic: works for any username, any home directory. Idempotent — safe t
 
 ## Usage
 
+Drop **both** `gz302-kali-setup.sh` and `z13_rgb_control.py` in the same folder, then:
+
 ```sh
 chmod +x gz302-kali-setup.sh
 ./gz302-kali-setup.sh                 # auto-detects current user
 ./gz302-kali-setup.sh someuser        # or pass an explicit username
 sudo reboot
 ```
+
+Idempotent — safe to re-run. The RGB GUI step looks for `z13_rgb_control.py` next to the script; if missing, that step is skipped with a warning (everything else still installs).
 
 ## What it does
 
@@ -34,9 +38,13 @@ sudo reboot
    - Tolerates the missing `asus-armoury` driver (not in Kali's kernel).
    - Adds `users`-group write perms on `asus-nb-wmi/ppt_*` so TDP/profile changes work without sudo.
 4. Relocates the tray app from any user's Downloads folder to `/opt/gz302-tray` and rewrites every desktop launcher (system + per-user). Re-syncs `/opt` from a fresh source if the upstream installer drops a newer copy.
-5. Installs a Bluetooth resume hook (`/usr/lib/systemd/system-sleep/gz302-bluetooth.sh`) — resets HCI and restarts `bluetoothd` on resume so BT mice/devices reconnect cleanly after suspend/hibernate (fixes flaky MT7925 BT on Strix Halo).
+5. Installs two resume-time hooks in `/usr/lib/systemd/system-sleep/`:
+   - `aaa-gz302-input-fast.sh` — re-authorizes keyboard/touchpad/lightbar USB devices at the start of post-resume so the lock screen is responsive within ~1 second of wake (instead of ~11 seconds with only the upstream hook).
+   - `gz302-bluetooth.sh` — resets HCI and restarts `bluetoothd` on resume so BT mice/devices reconnect cleanly (Strix Halo MT7925 fix).
 6. Adds the user to the `users` group for unprivileged `z13ctl` access.
 7. Sets sensible defaults: 80% battery limit, balanced profile.
+8. Installs the **Z13 RGB Control GUI** (PyQt6 app) to `/opt/z13-rgb-control/` and adds a KDE menu launcher. Tabbed Keyboard / Lightbar control with full mode independence (static, breathe, color cycle, rainbow, strobe), color picker, brightness, speed, and per-device off. Skipped if `z13rgb.py` and `z13rgb.desktop` aren't present alongside the setup script.
+8. Installs **Z13 RGB Control GUI** to `/opt/z13-rgb-control/` with a KDE menu launcher — full keyboard + lightbar lighting control (modes, colors, brightness, speed, save profiles).
 
 ## Requirements
 
