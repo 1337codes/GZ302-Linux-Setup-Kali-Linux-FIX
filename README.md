@@ -6,7 +6,8 @@ One-shot replay script for getting Kali Linux (KDE) working cleanly on the **ASU
 
 ```sh
 chmod +x gz302-kali-setup.sh
-./gz302-kali-setup.sh
+./gz302-kali-setup.sh                 # auto-detects current user
+./gz302-kali-setup.sh someuser        # or pass an explicit username
 sudo reboot
 ```
 
@@ -16,9 +17,12 @@ Idempotent — safe to re-run.
 
 1. Runs the upstream [th3cavalry/GZ302-Linux-Setup](https://github.com/th3cavalry/GZ302-Linux-Setup) unified installer (hardware fixes + z13ctl + display tools, no optional modules).
 2. Adds extra suspend-reliability kernel params: `amd_pmc.enable_stb=1`, `rtc_cmos.use_acpi_alarm=1`.
-3. Patches `z13ctl-perms.service` to tolerate the missing `asus-armoury` driver (not built into Kali's kernel).
-4. Adds the user to the `users` group for unprivileged `z13ctl` access.
-5. Sets sensible defaults: 80% battery limit, balanced profile.
+3. Patches `z13ctl-perms.service`:
+   - Tolerates the missing `asus-armoury` driver (not in Kali's kernel).
+   - Adds `users`-group write perms on `asus-nb-wmi/ppt_*` so TDP/profile changes work without sudo.
+4. Relocates the tray app from any user's Downloads folder to `/opt/gz302-tray` and rewrites every desktop launcher (system + per-user).
+5. Adds the user to the `users` group for unprivileged `z13ctl` access.
+6. Sets sensible defaults: 80% battery limit, balanced profile.
 
 ## Requirements
 
